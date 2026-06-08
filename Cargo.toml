@@ -1,0 +1,15 @@
+[package]
+name = "capability"
+version = "0.1.0"
+edition = "2024"
+description = "The thin, audited check for the platform's revocable-grant pattern: the capability type + the one verify rule. No storage, no issuance, no network."
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+serde_json = "1.0"
