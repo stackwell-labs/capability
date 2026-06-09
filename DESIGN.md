@@ -8,10 +8,11 @@ Drive grants, postbox relay-handles, Granite's issued grants, and social-graph
 contacts are four hand-rolled versions of one idea: *a scoped, revocable
 permission the resource owner issued, the actor presents, the resource checks
 **live**.* The duplication isn't the point — the point is the **invariant**: a
-capability check must (a) be rejected if revoked, (b) only honor the rightful
-holder, (c) stay within scope. Four implementations = four chances to forget one
-(esp. (a), the live-revocation that makes "unsubscribe" real). One shared check
-makes those true **by construction**.
+capability check must (a) be rejected if revoked, (b) only be honored in the
+environment it was minted in, (c) only honor the rightful holder, (d) stay
+within scope. Four implementations = four chances to forget one (esp. (a), the
+live-revocation that makes "unsubscribe" real). One shared check makes those
+true **by construction**.
 
 ## What it is (thin, by design)
 
@@ -22,12 +23,14 @@ their scope shape). The crate owns only the rule everyone must obey.
 ```rust
 pub struct CapId(pub String);                 // opaque capability id (a handle / grant_id)
 pub enum Status { Active, Revoked }
+pub enum Environment { Prod, Test { tenant: String } }   // which world the cap belongs to
 
 pub struct Capability<S> {
     pub id: CapId,
-    pub owner: String,     // who issued it (the resource owner / recipient)
-    pub holder: String,    // who may present it (the acting app/agent id, or sub)
-    pub scope: S,          // service-defined
+    pub owner: String,            // who issued it (the resource owner / recipient)
+    pub holder: String,           // who may present it (the acting app/agent id, or sub)
+    pub environment: Environment, // world it was minted in (from the granter's verified token)
+    pub scope: S,                 // service-defined
     pub status: Status,
     pub created_at: i64,
 }
@@ -36,16 +39,19 @@ pub struct Capability<S> {
 /// what's being requested?
 pub trait Scope { type Request; fn covers(&self, requested: &Self::Request) -> bool; }
 
-pub enum CapError { Revoked, WrongHolder, OutOfScope }
+pub enum CapError { Revoked, EnvironmentMismatch, WrongHolder, OutOfScope }
 
 /// THE check. Every "may X do Y" in every service goes through this. Order
-/// matters: revocation first, so a revoked cap is dead before anything else.
+/// matters: revocation first (a dead cap leaks nothing), then environment (a
+/// cross-environment cap leaks nothing about holder/scope), then holder, scope.
 pub fn verify<S: Scope>(
     cap: &Capability<S>,
     presented_by: &str,
+    presenter_env: &Environment,
     requested: &S::Request,
 ) -> Result<(), CapError> {
     match cap.status { Status::Revoked => return Err(CapError::Revoked), Status::Active => {} }
+    if cap.environment != *presenter_env { return Err(CapError::EnvironmentMismatch); }
     if cap.holder != presented_by { return Err(CapError::WrongHolder); }
     if !cap.scope.covers(requested) { return Err(CapError::OutOfScope); }
     Ok(())
@@ -54,6 +60,33 @@ pub fn verify<S: Scope>(
 
 Revoke is just `status = Revoked` in the service's store; because `verify` reads
 status first and lives at the gate, revocation is instant for everyone.
+
+## Environment (v0.2): test authority cannot launder into prod
+
+Chirp's keyset separation makes prod-vs-test unforgeable at the *token* layer
+(`ChirpVerifiedToken.environment` is derived from which keyset verified the
+token). Grants are the platform's second authority currency — without an
+environment on the cap, a test identity could mint a grant that later verifies
+against prod data. v0.2 closes that:
+
+- **Mint**: set `environment` from the *granter's* verified token. `Test`
+  carries the chirp test tenant, so test tenants are isolated from each other
+  too.
+- **Verify**: takes the *presenter's* verified environment and rejects on
+  mismatch. Both signature changes are deliberately compile-breaking — services
+  can't forget to thread the bit, only deliberately fake it.
+- **Persistence**: the field has **no serde default**. A legacy record without
+  it fails loudly at deserialize; adopting services backfill `Prod` in an
+  explicit one-time migration (correct: everything persisted pre-v0.2 was
+  prod-minted), never via a standing default that would let a future bug
+  silently mint prod credentials.
+
+This is the *checked* half of environment isolation. The *structural* half —
+partitioning grant **storage** by the verified environment (e.g. a
+`test#{tenant}#` key prefix derived from the request's token, so a test cap is
+unreachable from a prod request even if every check were skipped) — lives in
+each service's store, per the no-storage rule above. Do it where stakes are
+highest (Drive, Granite) as services migrate.
 
 ## What stays in each service (NOT shared)
 
