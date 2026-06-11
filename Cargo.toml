@@ -1,6 +1,6 @@
 [package]
 name = "capability"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "The thin, audited check for the platform's revocable-grant pattern: the capability type + the one verify rule. No storage, no issuance, no network."
 

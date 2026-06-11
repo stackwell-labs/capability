@@ -60,6 +60,77 @@ impl fmt::Display for Environment {
     }
 }
 
+/// The one "no laundering into prod" mismatch. Returned when a stored artifact's
+/// environment does not equal the caller's. Carries the `Display` of both so the
+/// caller can log/audit which way the laundering was attempted (a `Test{tenant}`
+/// artifact reaching for `Prod`, or vice versa, or a cross-tenant test mismatch)
+/// without re-deriving it. Equality is exact and per-tenant (`Test{a} != Test{b}`),
+/// since [`Environment`] derives `Eq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvMismatch {
+    /// The environment the artifact (grant / approval / token) was minted in.
+    pub stored: Environment,
+    /// The environment the caller is acting in (derived from its verified
+    /// credential / keyset — never requester-set).
+    pub caller: Environment,
+}
+
+impl fmt::Display for EnvMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "environment mismatch: artifact minted in {} but caller is acting in {} \
+             (a {} artifact must never act in {})",
+            self.stored, self.caller, self.stored, self.caller
+        )
+    }
+}
+
+impl std::error::Error for EnvMismatch {}
+
+impl Environment {
+    /// THE no-laundering guard. Every effect plane (capability grants, Granite
+    /// approvals, any future env-tagged artifact) derives the SAME check from this
+    /// one method instead of re-hand-rolling it: *the stored artifact's environment
+    /// must equal the caller's, else refuse.*
+    ///
+    /// `self` is the artifact's environment (the world it was minted in); `caller`
+    /// is the environment the actor is running in — both DERIVED from a verified
+    /// credential / keyset upstream, never requester-set, so the bit is unforgeable
+    /// here. Call this immediately before an irreversible act so there is no gap
+    /// between the check and the action. A `Test{tenant}` artifact can never act in
+    /// `Prod` (or another tenant), and a `Prod` artifact can never be acted on by a
+    /// `Test` caller — enforced by construction here, not by a comment at each
+    /// call site.
+    ///
+    /// Fail-closed is the caller's responsibility at the *boundary*: an absent /
+    /// untagged environment must be read as the strictest (`Prod`) before reaching
+    /// this guard — this crate's `Environment` has no serde default precisely so a
+    /// missing tag fails loudly rather than silently laundering into prod.
+    pub fn ensure_matches(&self, caller: &Environment) -> Result<(), EnvMismatch> {
+        ensure_same_environment(self, caller)
+    }
+}
+
+/// Free-function form of the [`Environment::ensure_matches`] guard, for call sites
+/// that read more naturally as `ensure_same_environment(stored, caller)` (e.g. a
+/// service comparing a loaded approval's environment against the caller's inside a
+/// loaded-then-write section). Identical semantics: exact, per-tenant equality, or
+/// a typed [`EnvMismatch`].
+pub fn ensure_same_environment(
+    stored: &Environment,
+    caller: &Environment,
+) -> Result<(), EnvMismatch> {
+    if stored == caller {
+        Ok(())
+    } else {
+        Err(EnvMismatch {
+            stored: stored.clone(),
+            caller: caller.clone(),
+        })
+    }
+}
+
 /// Liveness of a capability. `verify` reads this first, so flipping a stored cap to
 /// `Revoked` is an instant, global "off" switch — the whole point of the pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +381,55 @@ mod tests {
             verify(&c, "someone_else", &Environment::Prod, &"write"),
             Err(CapError::WrongHolder)
         );
+    }
+
+    #[test]
+    fn ensure_matches_same_env_is_ok() {
+        assert_eq!(Environment::Prod.ensure_matches(&Environment::Prod), Ok(()));
+        assert_eq!(
+            test_env("t1").ensure_matches(&test_env("t1")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn ensure_matches_prod_vs_test_is_err_both_ways() {
+        let err = Environment::Prod.ensure_matches(&test_env("t1")).unwrap_err();
+        assert_eq!(err.stored, Environment::Prod);
+        assert_eq!(err.caller, test_env("t1"));
+
+        let err = test_env("t1").ensure_matches(&Environment::Prod).unwrap_err();
+        assert_eq!(err.stored, test_env("t1"));
+        assert_eq!(err.caller, Environment::Prod);
+    }
+
+    #[test]
+    fn ensure_matches_test_a_vs_test_b_is_err() {
+        let err = test_env("a").ensure_matches(&test_env("b")).unwrap_err();
+        assert_eq!(err.stored, test_env("a"));
+        assert_eq!(err.caller, test_env("b"));
+    }
+
+    /// The free-function form is identical to the method.
+    #[test]
+    fn free_ensure_same_environment_matches_method() {
+        assert_eq!(
+            ensure_same_environment(&Environment::Prod, &Environment::Prod),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_same_environment(&test_env("a"), &test_env("b")),
+            test_env("a").ensure_matches(&test_env("b"))
+        );
+    }
+
+    /// The error Display names both environments so it can be audited.
+    #[test]
+    fn env_mismatch_display_carries_both() {
+        let err = test_env("t1").ensure_matches(&Environment::Prod).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("test:t1"), "{s}");
+        assert!(s.contains("prod"), "{s}");
     }
 
     /// A serde-able scope so the whole Capability is serde-able.
