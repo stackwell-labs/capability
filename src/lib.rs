@@ -140,6 +140,140 @@ pub enum Status {
     Revoked,
 }
 
+/// What a capability lets its holder *do*. The lattice over these is the heart of
+/// the unified authority plane (see `capability-lattice.md`):
+///
+/// - `Read`, `Append`, `Grant` are **reversible** — freely held, freely
+///   [attenuated](Capability::attenuate) downward, never need a Warden.
+/// - `Purge`, `Control` are **irreversible** — *unreachable by attenuation* and
+///   with **no public constructor**. The sole origin of a `Rights` value carrying
+///   one is [`warden::settle`], minted against a granite approval. "An agent cannot
+///   destroy data" is therefore a **type fact**: nothing an agent holds or can call
+///   manufactures a `Purge`/`Control` right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Right {
+    /// Read existing data. Reversible.
+    Read,
+    /// Append new data (op-DAG growth; never destroys). Reversible.
+    Append,
+    /// Delegate (attenuate-and-issue) a weaker capability. Reversible.
+    Grant,
+    /// Irreversibly destroy data (crypto-shred / purge). Warden-only.
+    Purge,
+    /// Irreversibly control a namespace (create/delete db, etc.). Warden-only.
+    Control,
+}
+
+impl Right {
+    /// The Warden discontinuity: `Purge`/`Control` are the irreversible rights.
+    /// A `Rights` set may carry one *only* if it was produced by [`warden::settle`].
+    pub const fn is_irreversible(self) -> bool {
+        matches!(self, Right::Purge | Right::Control)
+    }
+}
+
+/// A set of [`Right`]s — what a capability authorizes.
+///
+/// The invariant the type enforces **by construction**: a `Rights` value that
+/// contains an irreversible right ([`Right::Purge`] / [`Right::Control`]) can be
+/// built *only* by [`warden::settle`]. Every public constructor on this type
+/// ([`Rights::reversible`], [`Rights::READ`], …, [`Rights::subset_of`]'s inputs)
+/// rejects irreversible rights, and [`Capability::attenuate`] can only *drop*
+/// rights. So no sequence of public/local calls yields a purge-authorizing set —
+/// that is the negative agent-safety vector, true by type, not by check.
+///
+/// Internally the set is just a `u8` bitset; the irreversible bits are settable
+/// only through the private [`Rights::from_bits_with_warden_seal`] used by
+/// [`warden::settle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Rights {
+    bits: u8,
+}
+
+impl Rights {
+    const READ_BIT: u8 = 1 << 0;
+    const APPEND_BIT: u8 = 1 << 1;
+    const GRANT_BIT: u8 = 1 << 2;
+    const PURGE_BIT: u8 = 1 << 3;
+    const CONTROL_BIT: u8 = 1 << 4;
+
+    const fn bit_of(r: Right) -> u8 {
+        match r {
+            Right::Read => Self::READ_BIT,
+            Right::Append => Self::APPEND_BIT,
+            Right::Grant => Self::GRANT_BIT,
+            Right::Purge => Self::PURGE_BIT,
+            Right::Control => Self::CONTROL_BIT,
+        }
+    }
+
+    const IRREVERSIBLE_MASK: u8 = Self::PURGE_BIT | Self::CONTROL_BIT;
+
+    /// The empty rights set.
+    pub const NONE: Rights = Rights { bits: 0 };
+    /// `{Read}`.
+    pub const READ: Rights = Rights {
+        bits: Self::READ_BIT,
+    };
+    /// `{Read, Append}` — the agent default (what `amber`'s agent scope holds).
+    pub const READ_APPEND: Rights = Rights {
+        bits: Self::READ_BIT | Self::APPEND_BIT,
+    };
+
+    /// Build a reversible rights set. **Panics** is impossible — instead, any
+    /// irreversible right in `rights` makes this return `None`, so there is no
+    /// public path from an iterator of rights to a purge-authorizing set. This is
+    /// the only public constructor that takes arbitrary rights, and it is sealed
+    /// against the irreversible ones.
+    pub fn reversible<I: IntoIterator<Item = Right>>(rights: I) -> Option<Rights> {
+        let mut bits = 0u8;
+        for r in rights {
+            if r.is_irreversible() {
+                return None;
+            }
+            bits |= Self::bit_of(r);
+        }
+        Some(Rights { bits })
+    }
+
+    /// The *only* way an irreversible right enters a `Rights` value. Private to the
+    /// crate; reachable solely through [`warden::settle`]. (The arbitrary-bits form
+    /// is never exposed — adopters cannot name it.)
+    fn from_bits_with_warden_seal(bits: u8) -> Rights {
+        Rights { bits }
+    }
+
+    /// Does this set contain `r`?
+    pub const fn contains(self, r: Right) -> bool {
+        self.bits & Self::bit_of(r) != 0
+    }
+
+    /// Is this set a subset of `other`? The lattice order on rights.
+    pub const fn subset_of(self, other: Rights) -> bool {
+        self.bits & other.bits == self.bits
+    }
+
+    /// Does this set carry an irreversible ([`Right::is_irreversible`]) right?
+    pub const fn has_irreversible(self) -> bool {
+        self.bits & Self::IRREVERSIBLE_MASK != 0
+    }
+
+    /// Iterate the rights in the set (for audit / display).
+    pub fn iter(self) -> impl Iterator<Item = Right> {
+        [
+            Right::Read,
+            Right::Append,
+            Right::Grant,
+            Right::Purge,
+            Right::Control,
+        ]
+        .into_iter()
+        .filter(move |&r| self.contains(r))
+    }
+}
+
 /// An issued capability: the resource owner (`owner`) granted `holder` a `scope`d
 /// permission, identified by `id`. The crate models only the *result* of issuance,
 /// never how it was granted. Services persist this in their own store; it is
@@ -169,17 +303,99 @@ pub struct Capability<S> {
     pub environment: Environment,
     /// Service-defined scope (see [`Scope`]).
     pub scope: S,
+    /// What the holder may *do* (see [`Rights`]). A capability carrying an
+    /// irreversible right ([`Right::Purge`]/[`Right::Control`]) can only have been
+    /// produced by [`warden::settle`].
+    pub rights: Rights,
     /// Live revocation state.
     pub status: Status,
     /// Unix seconds at issuance.
     pub created_at: i64,
 }
 
-/// A service-defined scope answers exactly one question: does what I hold cover
-/// what's being requested? `Request` is the service's "requested action" type.
+impl<S: Clone> Capability<S> {
+    /// FREE · LOCAL · TOTAL · DOWNWARD-ONLY. The lattice meet: derive a *weaker*
+    /// capability from one you hold. There is deliberately **no** `widen` /
+    /// `add_right` anywhere in this crate.
+    ///
+    /// The new `scope` must be [within](Scope::within) the current scope, and the
+    /// new `rights` must be a [subset](Rights::subset_of) of the current rights —
+    /// otherwise [`AttenuateError`]. No I/O, no Warden, no network. Holding a
+    /// capability lets you derive *only* weaker ones.
+    ///
+    /// Because `attenuate` can only *drop* rights and `Rights`'s public
+    /// constructors reject the irreversible ones, no `attenuate` sequence starting
+    /// from a reversible capability can ever reach a `Purge`/`Control` right — the
+    /// negative agent-safety vector, true by construction.
+    pub fn attenuate(&self, scope: S, rights: Rights) -> Result<Capability<S>, AttenuateError>
+    where
+        S: Scope,
+    {
+        if !scope.within(&self.scope) {
+            return Err(AttenuateError::ScopeWidened);
+        }
+        if !rights.subset_of(self.rights) {
+            return Err(AttenuateError::RightsWidened);
+        }
+        Ok(Capability {
+            id: self.id.clone(),
+            owner: self.owner.clone(),
+            holder: self.holder.clone(),
+            environment: self.environment.clone(),
+            scope,
+            rights,
+            status: self.status,
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// Why an [`attenuate`](Capability::attenuate) call was rejected. Both variants mean
+/// the request tried to go *up* the lattice (the only thing `attenuate` forbids).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttenuateError {
+    /// The requested scope is not within the parent's scope (would widen).
+    ScopeWidened,
+    /// The requested rights are not a subset of the parent's (would add a right).
+    RightsWidened,
+}
+
+impl fmt::Display for AttenuateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            AttenuateError::ScopeWidened => "attenuate may only narrow scope, never widen it",
+            AttenuateError::RightsWidened => "attenuate may only drop rights, never add them",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for AttenuateError {}
+
+/// A service-defined scope answers two questions: does what I hold cover what's
+/// being requested ([`covers`](Scope::covers)), and is a candidate scope *within*
+/// (narrower than or equal to) this one ([`within`](Scope::within), the lattice
+/// partial order [`attenuate`](Capability::attenuate) needs).
+///
+/// `Request` is the service's "requested action" type.
 pub trait Scope {
     type Request;
+
+    /// Does this scope cover the requested action? The `verify`/`authorizes` check.
     fn covers(&self, requested: &Self::Request) -> bool;
+
+    /// Is `self` *within* `parent` — i.e. does the parent scope dominate this one in
+    /// the lattice (narrower-or-equal)? Used by [`Capability::attenuate`] to forbid
+    /// widening.
+    ///
+    /// **Fail-closed default:** the default returns `false`. A scope type that does
+    /// not define its own partial order therefore cannot be attenuated *into* (every
+    /// attenuation is rejected as a widen) — never the reverse. Services that want
+    /// downward delegation override this with their real narrowing relation (drive's
+    /// subtree containment, amber's db/namespace prefix, etc.).
+    fn within(&self, _parent: &Self) -> bool {
+        false
+    }
 }
 
 /// Why a [`verify`] check failed. The variant tells the caller which rule was
@@ -195,6 +411,10 @@ pub enum CapError {
     WrongHolder,
     /// The requested action falls outside the capability's scope.
     OutOfScope,
+    /// The capability does not carry the [`Right`] the action requires. Checked
+    /// LAST — after revocation, environment, holder, and scope — so a revoked or
+    /// cross-environment cap never leaks via a rights mismatch.
+    MissingRight,
 }
 
 impl fmt::Display for CapError {
@@ -206,6 +426,7 @@ impl fmt::Display for CapError {
             }
             CapError::WrongHolder => "capability presented by the wrong holder",
             CapError::OutOfScope => "requested action is outside the capability's scope",
+            CapError::MissingRight => "capability does not carry the right the action requires",
         };
         f.write_str(msg)
     }
@@ -242,6 +463,155 @@ pub fn verify<S: Scope>(
     Ok(())
 }
 
+/// THE check, rights-aware. Identical to [`verify`] but adds a final rights step:
+/// after revocation → environment → holder → scope, the capability must also carry
+/// the [`Right`] the action requires. The rights step is **last** by design, so a
+/// revoked or cross-environment cap dies before rights are ever examined — a rights
+/// mismatch never leaks on a dead or cross-env cap.
+///
+/// `presenter_env` must come from the presenter's *verified* token, never from
+/// anything the presenter sent.
+pub fn authorizes<S: Scope>(
+    cap: &Capability<S>,
+    presented_by: &str,
+    presenter_env: &Environment,
+    requested: &S::Request,
+    required: Right,
+) -> Result<(), CapError> {
+    verify(cap, presented_by, presenter_env, requested)?;
+    if !cap.rights.contains(required) {
+        return Err(CapError::MissingRight);
+    }
+    Ok(())
+}
+
+/// The sealed Warden boundary: the *only* origin of a capability carrying an
+/// irreversible right ([`Right::Purge`] / [`Right::Control`]).
+///
+/// # The dependency-direction seal
+///
+/// `capability` is the leaf primitive — it must **not** depend on `granite-client`
+/// (that arrow points the other way: `granite-client` re-exports
+/// [`Environment`]). So `warden::settle` cannot take a `granite-client`
+/// `ApprovalGrant`/`GrantVerification`. Instead this module defines an **opaque
+/// approval witness** ([`ApprovalWitness`]) whose only constructor
+/// ([`ApprovalWitness::from_granite`]) is the seam the granite side calls, passing
+/// only *primitive projections* `capability` already owns (the approval's
+/// environment, the scope+action it was bound to, and which irreversible right it
+/// approved). The witness's fields are private, so:
+///
+/// - Adopters (drive/amber/an agent) **cannot** construct an [`ApprovalWitness`]
+///   out of thin air — they must obtain one from the granite side, which only
+///   produces it from a real, settled approval.
+/// - `capability` never names a granite type, so the dependency arrow
+///   `capability ← granite-client` stays unreversed.
+///
+/// [`settle`] consumes the witness and yields a short-lived capability bound to the
+/// approval's scope + action — the two-phase submit→approve→settle binding amber
+/// and drive already enforce, expressed as a type.
+pub mod warden {
+    use super::*;
+
+    /// Which irreversible right an approval authorized. A closed enum so the witness
+    /// can only ever carry `Purge` or `Control`, never a reversible right.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Irreversible {
+        Purge,
+        Control,
+    }
+
+    impl Irreversible {
+        /// The [`Right`] this maps to.
+        pub const fn right(self) -> Right {
+            match self {
+                Irreversible::Purge => Right::Purge,
+                Irreversible::Control => Right::Control,
+            }
+        }
+    }
+
+    /// An **opaque, unforgeable** proof that a granite approval settled. Its fields
+    /// are private; the only constructor is [`ApprovalWitness::from_granite`], which
+    /// the granite side (granite-client / the granite backend) calls after it has
+    /// destructured its own `ApprovalGrant` into these primitives. Adopters cannot
+    /// build one locally — that is what makes an irreversible right unreachable
+    /// except through a real settled approval.
+    ///
+    /// It deliberately carries **no** granite type — only an [`Environment`], the
+    /// approved scope, who may hold the minted cap, the approval id, and which
+    /// [`Irreversible`] right was approved. This keeps `capability` a leaf.
+    #[derive(Debug, Clone)]
+    pub struct ApprovalWitness<S> {
+        environment: Environment,
+        scope: S,
+        owner: String,
+        holder: String,
+        approval_id: String,
+        right: Irreversible,
+    }
+
+    impl<S> ApprovalWitness<S> {
+        /// THE seam. Called by the granite side after a real approval settles,
+        /// passing primitive projections of its `ApprovalGrant`. Because this is the
+        /// sole constructor and it lives behind the granite side's settle logic, an
+        /// adopter cannot manufacture an irreversible right — it must route through
+        /// a genuine approval. `capability` names no granite type here.
+        pub fn from_granite(
+            environment: Environment,
+            scope: S,
+            owner: String,
+            holder: String,
+            approval_id: String,
+            right: Irreversible,
+        ) -> ApprovalWitness<S> {
+            ApprovalWitness {
+                environment,
+                scope,
+                owner,
+                holder,
+                approval_id,
+                right,
+            }
+        }
+
+        /// The approval id this witness was minted from (for audit / the cap's id).
+        pub fn approval_id(&self) -> &str {
+            &self.approval_id
+        }
+
+        /// Which irreversible right the approval authorized.
+        pub fn right(&self) -> Irreversible {
+            self.right
+        }
+    }
+
+    /// Mint a capability carrying an irreversible right. The **only** function in the
+    /// crate that produces a `Rights` value containing [`Right::Purge`] /
+    /// [`Right::Control`].
+    ///
+    /// The minted capability is bound to the approval's scope, owner, holder, and
+    /// environment, and carries exactly the one approved irreversible right (no
+    /// reversible rights are smuggled in — exercise reversible rights via a separate
+    /// reversibly-constructed capability). It is `Active`; revocation/expiry remain
+    /// the service's responsibility.
+    ///
+    /// This is `amber`'s `settle_purge`/`settle_shred` and `drive`'s
+    /// `erase_owner_settle`, expressed as the one typed mint.
+    pub fn settle<S>(witness: ApprovalWitness<S>, created_at: i64) -> Capability<S> {
+        let bits = Rights::bit_of(witness.right.right());
+        Capability {
+            id: CapId(witness.approval_id),
+            owner: witness.owner,
+            holder: witness.holder,
+            environment: witness.environment,
+            scope: witness.scope,
+            rights: Rights::from_bits_with_warden_seal(bits),
+            status: Status::Active,
+            created_at,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +623,9 @@ mod tests {
         type Request = &'static str;
         fn covers(&self, requested: &&'static str) -> bool {
             self.0 == *requested
+        }
+        fn within(&self, parent: &Self) -> bool {
+            self.0 == parent.0
         }
     }
 
@@ -278,6 +651,7 @@ mod tests {
             holder: holder.into(),
             environment,
             scope,
+            rights: Rights::READ,
             status,
             created_at: 1_780_000_000,
         }
@@ -442,6 +816,9 @@ mod tests {
         fn covers(&self, _requested: &()) -> bool {
             true
         }
+        fn within(&self, _parent: &Self) -> bool {
+            true
+        }
     }
 
     #[cfg(feature = "serde")]
@@ -454,6 +831,7 @@ mod tests {
                 holder: "holder".into(),
                 environment,
                 scope: UnitScope,
+                rights: Rights::READ_APPEND,
                 status: Status::Active,
                 created_at: 7,
             };
@@ -479,5 +857,258 @@ mod tests {
         }"#;
         let err = serde_json::from_str::<Capability<UnitScope>>(legacy).unwrap_err();
         assert!(err.to_string().contains("environment"), "{err}");
+    }
+
+    // ----------------------------------------------------------------------
+    // Lattice conformance vectors (capability-lattice.md "Conformance").
+    // ----------------------------------------------------------------------
+
+    /// A scope with a real narrowing order: a set of allowed strings; `within` is
+    /// subset containment, `covers` is membership.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct SetScope(Vec<&'static str>);
+    impl Scope for SetScope {
+        type Request = &'static str;
+        fn covers(&self, requested: &&'static str) -> bool {
+            self.0.contains(requested)
+        }
+        fn within(&self, parent: &Self) -> bool {
+            // self ⊆ parent
+            self.0.iter().all(|x| parent.0.contains(x))
+        }
+    }
+
+    fn lattice_cap(scope: SetScope, rights: Rights) -> Capability<SetScope> {
+        Capability {
+            id: CapId("cap_lat".into()),
+            owner: "owner".into(),
+            holder: "agent".into(),
+            environment: Environment::Prod,
+            scope,
+            rights,
+            status: Status::Active,
+            created_at: 1,
+        }
+    }
+
+    /// Rights public constructors reject the irreversible rights — there is no
+    /// public path from an iterator of rights to a Purge/Control set.
+    #[test]
+    fn rights_reversible_rejects_irreversible() {
+        assert!(Rights::reversible([Right::Read, Right::Append, Right::Grant]).is_some());
+        assert!(Rights::reversible([Right::Read, Right::Purge]).is_none());
+        assert!(Rights::reversible([Right::Control]).is_none());
+        // And nothing reversible has an irreversible bit set.
+        let r = Rights::reversible([Right::Read, Right::Append, Right::Grant]).unwrap();
+        assert!(!r.has_irreversible());
+    }
+
+    /// CONFORMANCE: attenuation is a meet. Widening scope or adding a right is
+    /// rejected; the result is always ≤ the parent; idempotent at a fixed point.
+    #[test]
+    fn attenuation_is_a_meet() {
+        let parent = lattice_cap(
+            SetScope(vec!["a", "b", "c"]),
+            Rights::reversible([Right::Read, Right::Append]).unwrap(),
+        );
+
+        // Narrowing scope + dropping rights: OK, result ≤ parent.
+        let child = parent
+            .attenuate(SetScope(vec!["a"]), Rights::READ)
+            .expect("narrowing must succeed");
+        assert!(child.scope.within(&parent.scope));
+        assert!(child.rights.subset_of(parent.rights));
+
+        // Widening scope: rejected.
+        assert_eq!(
+            parent.attenuate(SetScope(vec!["a", "b", "c", "d"]), Rights::READ),
+            Err(AttenuateError::ScopeWidened)
+        );
+
+        // Adding a right (superset): rejected. parent has {Read,Append}; ask for
+        // {Read,Append,Grant}.
+        let superset = Rights::reversible([Right::Read, Right::Append, Right::Grant]).unwrap();
+        assert_eq!(
+            parent.attenuate(SetScope(vec!["a"]), superset),
+            Err(AttenuateError::RightsWidened)
+        );
+
+        // Idempotent at a fixed point: attenuate to itself succeeds and is equal.
+        let same = parent
+            .attenuate(parent.scope.clone(), parent.rights)
+            .unwrap();
+        assert_eq!(same.scope, parent.scope);
+        assert_eq!(same.rights, parent.rights);
+    }
+
+    /// CONFORMANCE (the negative agent-safety vector): starting from ANY reversible
+    /// capability, no sequence of `attenuate` yields a capability that authorizes a
+    /// purge op. `attenuate` only drops rights, and the parent never had Purge —
+    /// because no public constructor can put it there. True by construction.
+    #[test]
+    fn no_local_path_to_purge_or_control() {
+        let agent = lattice_cap(
+            SetScope(vec!["x", "y"]),
+            Rights::reversible([Right::Read, Right::Append, Right::Grant]).unwrap(),
+        );
+        assert!(!agent.rights.has_irreversible());
+
+        // Try every single-step attenuation that could conceivably add a right.
+        // Each must either fail or produce a cap with no irreversible right.
+        for scope in [SetScope(vec!["x"]), SetScope(vec!["x", "y"]), SetScope(vec![])] {
+            for rights in [
+                Rights::NONE,
+                Rights::READ,
+                Rights::READ_APPEND,
+                Rights::reversible([Right::Grant]).unwrap(),
+                Rights::reversible([Right::Read, Right::Append, Right::Grant]).unwrap(),
+            ] {
+                if let Ok(child) = agent.attenuate(scope.clone(), rights) {
+                    assert!(
+                        !child.rights.has_irreversible(),
+                        "attenuation produced an irreversible right"
+                    );
+                    // And it never authorizes a Purge/Control op (whether it fails
+                    // on scope or on the missing right, it must never be Ok).
+                    assert_ne!(
+                        authorizes(&child, "agent", &Environment::Prod, &"x", Right::Purge),
+                        Ok(())
+                    );
+                    assert_ne!(
+                        authorizes(&child, "agent", &Environment::Prod, &"x", Right::Control),
+                        Ok(())
+                    );
+                }
+            }
+        }
+    }
+
+    /// CONFORMANCE: warden mint is scope+action bound. `settle` yields a capability
+    /// whose scope, owner, holder, env, and right equal the approval's; it
+    /// authorizes the approved purge but not a different owner/right.
+    #[test]
+    fn warden_mint_is_bound() {
+        let witness = warden::ApprovalWitness::from_granite(
+            Environment::Prod,
+            SetScope(vec!["db_42"]),
+            "owner_alice".into(),
+            "operator".into(),
+            "appr_123".into(),
+            warden::Irreversible::Purge,
+        );
+        let cap = warden::settle(witness, 1_780_000_000);
+
+        // Bound to the approval's identity.
+        assert_eq!(cap.id, CapId("appr_123".into()));
+        assert_eq!(cap.owner, "owner_alice");
+        assert_eq!(cap.holder, "operator");
+        assert_eq!(cap.environment, Environment::Prod);
+        assert_eq!(cap.scope, SetScope(vec!["db_42"]));
+
+        // Carries exactly the approved irreversible right, nothing reversible.
+        assert!(cap.rights.contains(Right::Purge));
+        assert!(!cap.rights.contains(Right::Control));
+        assert!(!cap.rights.contains(Right::Read));
+
+        // Authorizes the approved purge on the approved scope...
+        assert_eq!(
+            authorizes(&cap, "operator", &Environment::Prod, &"db_42", Right::Purge),
+            Ok(())
+        );
+        // ...but not a different scope (action-bound),
+        assert_eq!(
+            authorizes(&cap, "operator", &Environment::Prod, &"db_99", Right::Purge),
+            Err(CapError::OutOfScope)
+        );
+        // ...nor a different right it was not minted for,
+        assert_eq!(
+            authorizes(&cap, "operator", &Environment::Prod, &"db_42", Right::Control),
+            Err(CapError::MissingRight)
+        );
+        // ...nor a different holder,
+        assert_eq!(
+            authorizes(&cap, "someone_else", &Environment::Prod, &"db_42", Right::Purge),
+            Err(CapError::WrongHolder)
+        );
+        // ...nor a cross-environment caller.
+        assert_eq!(
+            authorizes(
+                &cap,
+                "operator",
+                &test_env("t1"),
+                &"db_42",
+                Right::Purge
+            ),
+            Err(CapError::EnvironmentMismatch)
+        );
+    }
+
+    /// A Control mint maps to the Control right (and only it).
+    #[test]
+    fn warden_mint_control() {
+        let witness = warden::ApprovalWitness::from_granite(
+            Environment::Prod,
+            SetScope(vec!["ns_root"]),
+            "owner".into(),
+            "operator".into(),
+            "appr_ctl".into(),
+            warden::Irreversible::Control,
+        );
+        let cap = warden::settle(witness, 1);
+        assert!(cap.rights.contains(Right::Control));
+        assert!(!cap.rights.contains(Right::Purge));
+    }
+
+    /// CONFORMANCE: `authorizes` precedence — revoked or wrong-env never authorizes
+    /// regardless of scope/right, and the rights step is LAST (after scope).
+    #[test]
+    fn authorizes_precedence_revocation_env_first_rights_last() {
+        // Revoked beats everything, including a missing right.
+        let revoked = Capability {
+            status: Status::Revoked,
+            ..lattice_cap(SetScope(vec!["a"]), Rights::READ)
+        };
+        assert_eq!(
+            authorizes(&revoked, "wrong", &test_env("t1"), &"nope", Right::Purge),
+            Err(CapError::Revoked)
+        );
+
+        // Wrong env beats holder, scope, and rights.
+        let wrong_env = Capability {
+            environment: test_env("t1"),
+            ..lattice_cap(SetScope(vec!["a"]), Rights::READ)
+        };
+        assert_eq!(
+            authorizes(&wrong_env, "wrong", &Environment::Prod, &"nope", Right::Purge),
+            Err(CapError::EnvironmentMismatch)
+        );
+
+        // Rights checked AFTER scope: an out-of-scope request with a missing right
+        // reports OutOfScope, not MissingRight.
+        let ok_env = lattice_cap(SetScope(vec!["a"]), Rights::READ);
+        assert_eq!(
+            authorizes(&ok_env, "agent", &Environment::Prod, &"nope", Right::Purge),
+            Err(CapError::OutOfScope)
+        );
+        // In scope but missing the right: MissingRight (the new last step).
+        assert_eq!(
+            authorizes(&ok_env, "agent", &Environment::Prod, &"a", Right::Purge),
+            Err(CapError::MissingRight)
+        );
+        // In scope and holding the right: OK.
+        assert_eq!(
+            authorizes(&ok_env, "agent", &Environment::Prod, &"a", Right::Read),
+            Ok(())
+        );
+    }
+
+    /// `subset_of` is the rights lattice order.
+    #[test]
+    fn rights_subset_order() {
+        let ra = Rights::READ_APPEND;
+        assert!(Rights::READ.subset_of(ra));
+        assert!(Rights::NONE.subset_of(Rights::READ));
+        assert!(!ra.subset_of(Rights::READ));
+        assert!(ra.subset_of(ra));
     }
 }
