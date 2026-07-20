@@ -2,6 +2,8 @@
 name = "capability"
 version = "0.4.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stackwell-labs/capability"
 description = "The thin, audited check for the platform's revocable-grant pattern: the capability type + the one verify rule. No storage, no issuance, no network."
 
 [dependencies]
