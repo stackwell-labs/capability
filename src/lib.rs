@@ -187,9 +187,35 @@ impl Right {
 /// only through the private [`Rights::from_bits_with_warden_seal`] used by
 /// [`warden::settle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Rights {
     bits: u8,
+}
+
+/// Loading `Rights` from storage is a public constructor too, so it is sealed like
+/// the others: the wire shape stays `{"bits":N}`, but only reversible bits load.
+/// A row carrying `Purge`/`Control` (or an unknown bit) fails to deserialize
+/// rather than becoming authority — mutable storage is not a way around
+/// [`warden::settle`]. A settled cap may still be *serialized* (an audit log), it
+/// just cannot be read back as one.
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for Rights {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Rights, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "Rights")]
+        struct RawRights {
+            bits: u8,
+        }
+        let RawRights { bits } = RawRights::deserialize(d)?;
+        let sealed = bits & !Rights::REVERSIBLE_MASK;
+        if sealed != 0 {
+            return Err(serde::de::Error::custom(format_args!(
+                "stored rights carry non-reversible bits {sealed:#04x}: Purge/Control are \
+                 minted only by warden::settle and never load from storage"
+            )));
+        }
+        Ok(Rights { bits })
+    }
 }
 
 impl Rights {
@@ -210,6 +236,10 @@ impl Rights {
     }
 
     const IRREVERSIBLE_MASK: u8 = Self::PURGE_BIT | Self::CONTROL_BIT;
+    /// Every bit a reversible set may carry. Anything outside it is irreversible or
+    /// unknown — never loadable (see the `Deserialize` impl).
+    #[cfg_attr(not(feature = "serde"), allow(dead_code))]
+    const REVERSIBLE_MASK: u8 = Self::READ_BIT | Self::APPEND_BIT | Self::GRANT_BIT;
 
     /// The empty rights set.
     pub const NONE: Rights = Rights { bits: 0 };
@@ -857,6 +887,89 @@ mod tests {
         }"#;
         let err = serde_json::from_str::<Capability<UnitScope>>(legacy).unwrap_err();
         assert!(err.to_string().contains("environment"), "{err}");
+    }
+
+    /// Stored `bits` values that must never deserialize into authority: Purge (8),
+    /// Control (16), both (24), an unknown bit (32), and every bit (255).
+    #[cfg(feature = "serde")]
+    const SEALED_BITS: [u8; 5] = [8, 16, 24, 32, 255];
+
+    #[cfg(feature = "serde")]
+    fn unit_cap_row(bits: u8) -> String {
+        format!(
+            r#"{{"id":"cap_42","owner":"owner","holder":"holder","environment":"Prod",
+               "scope":null,"rights":{{"bits":{bits}}},"status":"Active","created_at":7}}"#
+        )
+    }
+
+    /// THE storage seal: a persisted `Rights` row edited to carry an irreversible
+    /// (or unknown) bit must fail to load, never yield a Purge/Control right. Only
+    /// `warden::settle` mints one, and storage is not a back door around it.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn rights_deserialize_rejects_irreversible_and_unknown_bits() {
+        for bits in SEALED_BITS {
+            let json = format!(r#"{{"bits":{bits}}}"#);
+            let parsed = serde_json::from_str::<Rights>(&json);
+            let err = match parsed {
+                Ok(r) => panic!("{json} deserialized into authority: {r:?}"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("{:#04x}", bits & !0b111)),
+                "{json}: {msg}"
+            );
+            assert!(msg.contains("warden::settle"), "{json}: {msg}");
+        }
+    }
+
+    /// Same seal through a whole `Capability` row (Drive's `StoredJoinCap.cap`,
+    /// any persisted grant): the row fails, it does not load with the bit dropped.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn capability_row_with_sealed_bits_fails_to_deserialize() {
+        for bits in SEALED_BITS {
+            let row = unit_cap_row(bits);
+            if let Ok(c) = serde_json::from_str::<Capability<UnitScope>>(&row) {
+                panic!("bits {bits} loaded as authority: {:?}", c.rights);
+            }
+        }
+    }
+
+    /// Every reversible set (all subsets of {Read, Append, Grant}) still loads and
+    /// round-trips to the identical wire shape, so existing rows are unaffected.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn every_reversible_rights_value_roundtrips() {
+        for bits in 0u8..=7 {
+            let json = format!(r#"{{"bits":{bits}}}"#);
+            let r: Rights = serde_json::from_str(&json).unwrap();
+            assert!(!r.has_irreversible());
+            assert_eq!(serde_json::to_string(&r).unwrap(), json);
+
+            let c: Capability<UnitScope> = serde_json::from_str(&unit_cap_row(bits)).unwrap();
+            assert_eq!(c.rights, r);
+        }
+    }
+
+    /// A settled Purge cap can be serialized (an audit log may record it) but can
+    /// never be read back as authority: settled caps are use-immediately.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn settled_purge_cap_serializes_but_does_not_deserialize() {
+        let witness = warden::ApprovalWitness::from_granite(
+            Environment::Prod,
+            UnitScope,
+            "owner".into(),
+            "operator".into(),
+            "appr_1".into(),
+            warden::Irreversible::Purge,
+        );
+        let cap = warden::settle(witness, 7);
+        let json = serde_json::to_string(&cap).unwrap();
+        assert!(json.contains(r#""rights":{"bits":8}"#), "{json}");
+        assert!(serde_json::from_str::<Capability<UnitScope>>(&json).is_err());
     }
 
     // ----------------------------------------------------------------------
