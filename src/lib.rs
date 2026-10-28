@@ -145,11 +145,16 @@ pub enum Status {
 ///
 /// - `Read`, `Append`, `Grant` are **reversible** — freely held, freely
 ///   [attenuated](Capability::attenuate) downward, never need a Warden.
-/// - `Purge`, `Control` are **irreversible** — *unreachable by attenuation* and
-///   with **no public constructor**. The sole origin of a `Rights` value carrying
-///   one is [`warden::settle`], minted against a granite approval. "An agent cannot
-///   destroy data" is therefore a **type fact**: nothing an agent holds or can call
-///   manufactures a `Purge`/`Control` right.
+/// - `Purge`, `Control` are **irreversible** — *unreachable by attenuation*, by
+///   every public [`Rights`] constructor, and by deserialization. The sole origin
+///   of a `Rights` value carrying one is [`warden::settle`], fed a
+///   [`warden::ApprovalWitness`].
+///
+/// What that does and does not guarantee: the type seals every path *except* the
+/// witness seam. [`warden::ApprovalWitness::from_granite`] is `pub` (this leaf
+/// crate cannot verify a Granite approval), so "an agent cannot destroy data"
+/// holds only if every `from_granite` call sits right after a verified Granite
+/// settle — an audited convention at each call site, not a type fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Right {
@@ -178,14 +183,14 @@ impl Right {
 /// The invariant the type enforces **by construction**: a `Rights` value that
 /// contains an irreversible right ([`Right::Purge`] / [`Right::Control`]) can be
 /// built *only* by [`warden::settle`]. Every public constructor on this type
-/// ([`Rights::reversible`], [`Rights::READ`], …, [`Rights::subset_of`]'s inputs)
-/// rejects irreversible rights, and [`Capability::attenuate`] can only *drop*
-/// rights. So no sequence of public/local calls yields a purge-authorizing set —
-/// that is the negative agent-safety vector, true by type, not by check.
+/// ([`Rights::reversible`], [`Rights::READ`], …) rejects or omits irreversible
+/// rights, deserialization refuses their bits (and any unknown bit), and
+/// [`Capability::attenuate`] can only *drop* rights. So no sequence of
+/// public/local calls, and no stored row, yields a purge-authorizing set without
+/// going through `settle` — whose own input is a trusted seam (see [`Right`]).
 ///
 /// Internally the set is just a `u8` bitset; the irreversible bits are settable
-/// only through the private [`Rights::from_bits_with_warden_seal`] used by
-/// [`warden::settle`].
+/// only through a private constructor used by [`warden::settle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Rights {
@@ -333,9 +338,12 @@ pub struct Capability<S> {
     pub environment: Environment,
     /// Service-defined scope (see [`Scope`]).
     pub scope: S,
-    /// What the holder may *do* (see [`Rights`]). A capability carrying an
-    /// irreversible right ([`Right::Purge`]/[`Right::Control`]) can only have been
-    /// produced by [`warden::settle`].
+    /// What the holder may *do* (see [`Rights`]). An irreversible right
+    /// ([`Right::Purge`]/[`Right::Control`]) here can only have come from
+    /// [`warden::settle`] — but because every field is `pub` and `Rights` is
+    /// `Copy`, code holding a settled cap can copy its `rights` into a literal
+    /// with another scope or holder. The scope binding of a settled cap therefore
+    /// holds by convention: use it immediately, never persist or re-scope it.
     pub rights: Rights,
     /// Live revocation state.
     pub status: Status,
@@ -515,30 +523,35 @@ pub fn authorizes<S: Scope>(
     Ok(())
 }
 
-/// The sealed Warden boundary: the *only* origin of a capability carrying an
+/// The Warden boundary: the *only* origin of a capability carrying an
 /// irreversible right ([`Right::Purge`] / [`Right::Control`]).
 ///
-/// # The dependency-direction seal
+/// # What is sealed, and what is a trusted seam
 ///
 /// `capability` is the leaf primitive — it must **not** depend on `granite-client`
 /// (that arrow points the other way: `granite-client` re-exports
-/// [`Environment`]). So `warden::settle` cannot take a `granite-client`
-/// `ApprovalGrant`/`GrantVerification`. Instead this module defines an **opaque
-/// approval witness** ([`ApprovalWitness`]) whose only constructor
-/// ([`ApprovalWitness::from_granite`]) is the seam the granite side calls, passing
-/// only *primitive projections* `capability` already owns (the approval's
-/// environment, the scope+action it was bound to, and which irreversible right it
-/// approved). The witness's fields are private, so:
+/// [`Environment`]) or on any crypto crate. So `warden::settle` cannot take, or
+/// verify, a `granite-client` `ApprovalGrant`/`GrantVerification`. Instead this
+/// module defines an approval witness
+/// ([`ApprovalWitness`](warden::ApprovalWitness)) whose only constructor
+/// ([`from_granite`](warden::ApprovalWitness::from_granite)) takes *primitive
+/// projections* `capability` already owns (the approval's environment, the scope
+/// it was bound to, and which irreversible right it approved).
 ///
-/// - Adopters (drive/amber/an agent) **cannot** construct an [`ApprovalWitness`]
-///   out of thin air — they must obtain one from the granite side, which only
-///   produces it from a real, settled approval.
-/// - `capability` never names a granite type, so the dependency arrow
-///   `capability ← granite-client` stays unreversed.
+/// - **Sealed by the type:** [`settle`](warden::settle) is the only function that
+///   puts an irreversible bit into a [`Rights`]; attenuation, the public `Rights`
+///   constructors and deserialization cannot.
+/// - **A trusted seam, not a type fact:** `from_granite` is `pub` and checks
+///   nothing, so any crate *can* call it. It must be called only right after a
+///   verified Granite settle; each call site is an audit point (today: Drive's
+///   `erase_owner_settle` and amber-serve's `authorize_warden_purge`).
+/// - **Use-immediately:** the settled cap's fields are `pub`, so its scope
+///   binding holds by convention. Exercise it with [`authorizes`] right away and
+///   never persist it (a serialized settled cap will not deserialize anyway).
 ///
-/// [`settle`] consumes the witness and yields a short-lived capability bound to the
-/// approval's scope + action — the two-phase submit→approve→settle binding amber
-/// and drive already enforce, expressed as a type.
+/// [`settle`](warden::settle) consumes the witness and yields a short-lived
+/// capability bound to the approval's scope + action — the two-phase
+/// submit→approve→settle binding amber and drive already enforce.
 pub mod warden {
     use super::*;
 
@@ -560,12 +573,12 @@ pub mod warden {
         }
     }
 
-    /// An **opaque, unforgeable** proof that a granite approval settled. Its fields
-    /// are private; the only constructor is [`ApprovalWitness::from_granite`], which
-    /// the granite side (granite-client / the granite backend) calls after it has
-    /// destructured its own `ApprovalGrant` into these primitives. Adopters cannot
-    /// build one locally — that is what makes an irreversible right unreachable
-    /// except through a real settled approval.
+    /// An **opaque** record that a granite approval settled. Its fields are
+    /// private and its only constructor is [`ApprovalWitness::from_granite`],
+    /// which the caller invokes after it has verified a Granite settle and
+    /// destructured the approval into these primitives. It is *not* unforgeable:
+    /// `from_granite` is `pub` and cannot check the approval, so the witness is
+    /// only as honest as its call site (see the [module docs](self)).
     ///
     /// It deliberately carries **no** granite type — only an [`Environment`], the
     /// approved scope, who may hold the minted cap, the approval id, and which
@@ -581,11 +594,13 @@ pub mod warden {
     }
 
     impl<S> ApprovalWitness<S> {
-        /// THE seam. Called by the granite side after a real approval settles,
-        /// passing primitive projections of its `ApprovalGrant`. Because this is the
-        /// sole constructor and it lives behind the granite side's settle logic, an
-        /// adopter cannot manufacture an irreversible right — it must route through
-        /// a genuine approval. `capability` names no granite type here.
+        /// THE trusted seam. Call it **only** immediately after verifying a Granite
+        /// settle for exactly this environment, scope, owner and right, passing
+        /// primitive projections of that approval. It verifies nothing itself —
+        /// `capability` names no granite type and holds no key — so a call
+        /// anywhere else mints a `Purge`/`Control` cap with no approval. Every call
+        /// site is an audit point; keep them few (today: Drive's
+        /// `erase_owner_settle` and amber-serve's `authorize_warden_purge`).
         pub fn from_granite(
             environment: Environment,
             scope: S,

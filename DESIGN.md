@@ -112,6 +112,39 @@ highest (Drive, Granite) as services migrate.
 
 Each step is behind the service's tests + a gated redeploy; no big-bang.
 
+## The Warden seal (v0.5): what is sealed, and what is a convention
+
+`Purge`/`Control` are the irreversible rights. What the crate guarantees, and
+where that guarantee stops:
+
+**Sealed by the type** (no code outside the crate can get around it):
+
+- `attenuate` only drops rights, so no attenuation adds `Purge`/`Control`.
+- Every public `Rights` constructor (`NONE`, `READ`, `READ_APPEND`,
+  `reversible`) rejects or omits the irreversible bits.
+- **Deserialization** (v0.5) accepts only `{Read, Append, Grant}` bits. A stored
+  row edited to `{"bits":8}`, or any irreversible or unknown bit, fails to load,
+  so mutable storage cannot mint a `Purge` right. A settled cap can be
+  serialized for an audit log, but it cannot be read back as authority.
+
+**A trusted seam, not a type fact:**
+
+- `ApprovalWitness::from_granite` is `pub`. The leaf crate cannot check a
+  Granite approval (that would need a crypto or granite dependency), so any
+  crate *can* call it. Call it only right after a verified Granite settle.
+  Each call site is an audit point. There are two in-tree today: Drive's
+  `erase_owner_settle` and amber-serve's `authorize_warden_purge`.
+- `Capability`'s fields are `pub` and `Rights` is `Copy`, so code holding a
+  settled cap can copy its `rights` into a struct literal with another scope.
+  The scope binding holds by convention. A settled cap must be used at once and
+  never persisted.
+
+"An agent cannot destroy data" therefore rests on the type seal above **plus**
+those two audited call sites. Making the seam itself unforgeable (private
+fields, and a witness that `capability` can verify) would break struct-literal
+construction across the consumers and needs a cross-repo witness-verification
+design. It is deferred.
+
 ## What it deliberately is NOT (yet)
 
 Capability **chains / attenuation / vouching** (the pigeon-mail / north-star
